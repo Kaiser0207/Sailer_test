@@ -1,0 +1,29 @@
+# Python & OS
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# VS Code / IDEs
+.vscode/
+
+# Weights & Biases
+wandb/
+
+# Datasets and Large Files (Crucial for ML)
+datasets/
+outputs/
+vox-profile-release/
+experiments/
+*.pt
+*.pth
+*.zip
+*.tar.gz
+*.wav
+*.mp3
