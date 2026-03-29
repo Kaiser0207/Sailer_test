@@ -2,40 +2,46 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import RobertaTokenizer, RobertaModel, WhisperModel
+import argparse
+import json
+from transformers import RobertaTokenizer, RobertaModel, WhisperModel, set_seed, get_cosine_schedule_with_warmup
 from tqdm import tqdm
 from sklearn.metrics import f1_score, average_precision_score, classification_report
 import numpy as np
 import os
 import wandb
+import random
 
 from src.experiment_tracker import ExperimentTracker
+
+# (原手寫 seed_everything 已被 transformers.set_seed 取代)
 from src.msp_dataset import MSP_Podcast_Dataset
 from src.sailer_model import SAILER_Model
 
 def main():
     """
-    SAILER 系統核心訓練迴圈 (Main Training Pipeline)。
-    負責組裝巨型預訓練模型 (Whisper, RoBERTa)、載入特徵與標籤，執行多任務聯合訓練，並追蹤指標。
+    SAILER 系統核心訓練迴圈 
+    負責組裝巨型預訓練模型 (Whisper, RoBERTa)、載入特徵與標籤，執行多任務聯合訓練，並追蹤指標
     """
     # ==========================================
     # 1. 訓練參數與基礎環境配置 (Configuration & Setup)
     # ==========================================
-    config = {
-        "model_name": "SAILER_BestSingleSystem",
-        "epochs": 15,            
-        "batch_size": 64,        
-        "learning_rate": 0.0005, 
-        "num_classes": 8,        
-        "secondary_class_num": 17
-    }
+    parser = argparse.ArgumentParser(description="SAILER Training Script")
+    parser.add_argument("--config", type=str, default="configs/default_config.json", help="Path to configuration JSON file")
+    args = parser.parse_args()
+
+    # 讀取外部 JSON Config 檔案
+    with open(args.config, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    # 採用正規套件鎖定一切亂數，確保實驗結果絕對可重現 (Reproducibility)
+    set_seed(config.get("seed", 42))
 
     tracker = ExperimentTracker(experiment_name=config["model_name"])
     tracker.save_config(config)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    data_dir = "/home/brant/Project/SAILER_test/datasets/MSP_Podcast_Data" 
+    data_dir = config["data_dir"] 
 
     # ==========================================
     # 2. 載入預估模型架構 (Load Pre-trained Encoders)
@@ -43,11 +49,9 @@ def main():
     # ==========================================
     r_tokenizer = RobertaTokenizer.from_pretrained("roberta-large")
 
-    # 載入 Whisper 編碼器，強制限制最大時間序列為 750 (轉換後為 15秒) 嚴格遵循論文規格
+    # 載入 Whisper 編碼器 
     whisper_enc = WhisperModel.from_pretrained(
-        "openai/whisper-large-v3",
-        max_source_positions=750,
-        ignore_mismatched_sizes=True
+        "openai/whisper-large-v3"
     ).encoder.to(device)
     
     roberta_model = RobertaModel.from_pretrained("roberta-large").to(device)
@@ -92,7 +96,21 @@ def main():
     criterion_secondary = nn.KLDivLoss(reduction='batchmean')
     criterion_avd = nn.MSELoss()
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config["learning_rate"])
+    # 加入 weight_decay=1e-4 以提供輕微正規化，對抗過擬合
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=config["learning_rate"], 
+        weight_decay=config.get("weight_decay", 1e-4)
+    )
+    
+    # 加入 Cosine Learning Rate Scheduler (附帶 Warmup)
+    total_steps = len(train_loader) * config["epochs"]
+    warmup_steps = int(total_steps * config.get("warmup_ratio", 0.1))
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, 
+        num_warmup_steps=warmup_steps, 
+        num_training_steps=total_steps
+    )
     
     scaler = torch.amp.GradScaler('cuda')
 
@@ -100,10 +118,27 @@ def main():
     best_min_map = 0.0
 
     # ==========================================
+    # 4.5 Sanity Check (防呆乾跑驗證機制)
+    # 在漫長的訓練開始前，強行過一次驗證集前向傳播，若有 Shape 不合會直接噴錯攔截。
+    # ==========================================
+    tracker.logger.info("啟動 Sanity Check (抽取一筆驗證資料預跑)...")
+    model.eval()
+    with torch.no_grad():
+        for batch in val_loader:
+            w_feat, t_ids, t_mask, label_dists, sec_dists, avd_targets, lengths = [b.to(device) for b in batch]
+            if w_feat.shape[-1] > 0:
+                with torch.amp.autocast('cuda'):
+                    w_seq = whisper_enc(w_feat).last_hidden_state
+                    roberta_out = roberta_model(input_ids=t_ids, attention_mask=t_mask, output_hidden_states=True)
+                    model(w_seq, roberta_out.hidden_states, t_mask, lengths)
+            break
+    tracker.logger.info("✅ Sanity Check 通過！網路無 Shape Mismatch，正式進入訓練迴圈！")
+
+    # ==========================================
     # 5. 主訓練迴圈 (Main Epoch Execution)
     # ==========================================
     for epoch in range(config["epochs"]):
-        print(f"\n[{epoch+1}/{config['epochs']}] Epoch 訓練開始...")
+        logger.info(f"====== [{epoch+1}/{config['epochs']}] 啟動 Epoch 訓練 ======")
         model.train()
         total_train_loss = 0
 
@@ -138,6 +173,9 @@ def main():
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            
+            # 更新排程器 (Scheduler Step)
+            scheduler.step()
 
             total_train_loss += loss.item()
             wandb.log({
@@ -216,28 +254,30 @@ def main():
         min_map = np.mean(min_aps) if min_aps else 0.0
         log_dict["val_min_mAP"] = min_map
 
-        print(f"\n{'='*40}")
-        print(f"Epoch {epoch+1} 驗證結果")
-        print(f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Min. mAP: {min_map:.4f}")
-        print(f"{'-'*40}")
-        print(classification_report(all_labels, all_preds, labels=list(range(8)), target_names=emotion_names, zero_division=0))
-        print(f"{'='*40}\n")
+        # 統一交給 Logging 紀錄
+        report = f"\n{'='*45}\n"
+        report += f" Epoch {epoch+1} 驗證報告 (Validation Report)\n"
+        report += f" Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Min. mAP: {min_map:.4f}\n"
+        report += f"{'-'*45}\n"
+        report += classification_report(all_labels, all_preds, labels=list(range(8)), target_names=emotion_names, zero_division=0)
+        report += f"\n{'='*45}"
+        
+        logger.info(report)
 
         tracker.log_metrics(epoch, avg_train_loss, avg_val_loss, val_acc)
         wandb.log(log_dict, step=epoch)
 
         # ==========================================
-        # 7. 雙重保險權重備份 (Checkpoint Check&Save)
+        # 7. 模型備份
         # ==========================================
-        
         if min_map > best_min_map:
             best_min_map = min_map
-            print(f"少數類別準確度 (Min. mAP): {min_map:.4f}，儲存特化權重...")
+            logger.info(f"少數類別準確度提升 (Min. mAP: {min_map:.4f}) ")
             torch.save(model.state_dict(), os.path.join(tracker.weights_dir, "best_model_min_map.pth"))
 
         if val_macro_f1 > best_f1:
             best_f1 = val_macro_f1
-            print(f"發現更高 (Macro F1): {val_macro_f1:.4f}，儲存最強綜合權重...")
+            logger.info(f"綜合泛化能力提升 (Macro F1: {val_macro_f1:.4f}) ")
             torch.save(model.state_dict(), os.path.join(tracker.weights_dir, "best_model_f1.pth"))
 
     tracker.close()

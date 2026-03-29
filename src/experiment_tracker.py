@@ -2,6 +2,7 @@ import os
 import sys
 import shutil
 import json
+import logging
 import datetime
 import wandb
 import matplotlib.pyplot as plt
@@ -32,10 +33,45 @@ class ExperimentTracker:
             name=f"{now}_{experiment_name}",      
             sync_tensorboard=True               
         )
-        print(f"實驗資料夾與 W&B 已建立: {self.exp_dir}")
+        
+        # 5. 建立本地日誌系統 (Professional Logging)
+        self.logger = self._setup_logging()
+        self.logger.info(f"實體實驗資料夾建立完成: {self.exp_dir}")
+        self.logger.info(f"所有的訓練紀錄將會同步保存至: {os.path.join(self.logs_dir, 'train.log')}")
 
         # 4. 註冊全局崩潰攔截器 (Auto Cleanup on Crash)
         self._setup_exception_hook()
+
+    def _setup_logging(self):
+        """
+        初始化專業級 Logging 系統，將執行期間的所有訊息輸出：
+        1. 終端機顯示 
+        2. 原封不動、附帶確切時間戳地將其備份寫入到當次實驗的 /logs/train.log
+        """
+        logger = logging.getLogger(self.exp_dir)
+        logger.setLevel(logging.INFO)
+        
+        # 避免重複綁定 Handle 造成日誌噴兩次
+        if not logger.handlers:
+            log_file = os.path.join(self.logs_dir, "train.log")
+            
+            # File Handler (寫入磁碟)
+            fh = logging.FileHandler(log_file, encoding='utf-8')
+            # Console Handler (印在螢幕)
+            ch = logging.StreamHandler(sys.stdout)
+            
+            # 格式： [月份-日期 小時:分鐘:秒數] INFO - 您的訊息
+            formatter = logging.Formatter('[%(asctime)s] %(levelname)s - %(message)s', datefmt='%m-%d %H:%M:%S')
+            fh.setFormatter(formatter)
+            ch.setFormatter(formatter)
+            
+            logger.addHandler(fh)
+            logger.addHandler(ch)
+            
+            # 防止預設的 root logger 再次搶去輸出
+            logger.propagate = False
+            
+        return logger
 
     def _setup_exception_hook(self):
         """
@@ -45,7 +81,10 @@ class ExperimentTracker:
         original_hook = sys.excepthook
         
         def cleanup_hook(exc_type, exc_value, exc_traceback):
-            print(f"\n[ExperimentTracker] 🚨 偵測到程式中止 ({exc_type.__name__})")
+            if hasattr(self, 'logger'):
+                self.logger.error(f"偵測到程式中止 ({exc_type.__name__})")
+            else:
+                print(f"\n[ExperimentTracker] 偵測到程式中止 ({exc_type.__name__})")
             
             # 把 TensorBoard 寫入流關閉
             if hasattr(self, 'writer'):

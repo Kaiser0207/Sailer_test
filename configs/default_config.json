@@ -1,0 +1,13 @@
+{
+    "model_name": "SAILER_BestSingleSystem",
+    "data_dir": "/home/brant/Project/SAILER_test/datasets/MSP_Podcast_Data",
+    "epochs": 15,
+    "batch_size": 64,
+    "learning_rate": 0.0005,
+    "weight_decay": 0.0001,
+    "warmup_ratio": 0.1,
+    "num_classes": 8,
+    "secondary_class_num": 17,
+    "dropout_rate": 0.3,
+    "seed": 42
+}

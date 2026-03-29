@@ -17,7 +17,7 @@ class MSP_Podcast_Dataset(Dataset):
         self.data_dir = data_dir
         self.split = split
         self.roberta_tokenizer = roberta_tokenizer
-        self.apply_aug = apply_aug and split == "Train" 
+        self.apply_aug = apply_aug and split == "Train"
         
         self.feat_dir = os.path.join(data_dir, "Whisper_Features_15s")
         self.transcripts_dir = os.path.join(data_dir, "Transcripts")
@@ -127,10 +127,15 @@ class MSP_Podcast_Dataset(Dataset):
         df_consensus = pd.read_csv(self.consensus_path)
 
         if self.split == "Train":
-            df_split = df_consensus[df_consensus['Split_Set'] == self.split]
-            df_valid = df_split[df_split['EmoClass'].isin(self.emotion_map_short.keys())]
-            df_no_agree = df_split[~df_split['EmoClass'].isin(self.emotion_map_short.keys())]
-            df_use = pd.concat([df_valid, df_no_agree])
+            # 1. 抓取所有純 Train Set 樣本 (包含共識與不共識)
+            df_train = df_consensus[df_consensus['Split_Set'] == "Train"]
+            
+            # 2. 論文隱藏細節：抓取 Dev Set 中廢棄的 (No agreement / Other) 樣本，偷渡進 Train Set 擴充資料量
+            df_dev = df_consensus[df_consensus['Split_Set'] == "Development"]
+            df_dev_unagreed = df_dev[~df_dev['EmoClass'].isin(self.emotion_map_short.keys())]
+            
+            # 兩者合併成為最龐大、混合度最高的訓練前線池
+            df_use = pd.concat([df_train, df_dev_unagreed])
         else:
             df_use = df_consensus[df_consensus['Split_Set'] == self.split]
             df_use = df_use[df_use['EmoClass'].isin(self.emotion_map_short.keys())]

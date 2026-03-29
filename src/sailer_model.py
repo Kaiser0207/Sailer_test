@@ -117,14 +117,16 @@ class SAILER_Model(nn.Module):
         s_out = self.speech_conv(w_seq.transpose(1, 2))  
 
         if lengths is not None:
-            mean_list = []
-            for i in range(s_out.shape[0]):
-                actual_len = min(lengths[i].item(), s_out.shape[2])
-                if actual_len > 0:
-                    mean_list.append(s_out[i, :, :actual_len].mean(dim=-1))
-                else:
-                    mean_list.append(s_out[i].mean(dim=-1))
-            s_emb = torch.stack(mean_list)  # 產出最終語音對齊特徵: [B, 256]
+            B, D, T = s_out.shape
+            # 動態有效長度保護 (確保不超過特徵矩陣的最大時間軸)
+            clipped_lengths = torch.clamp(lengths, max=T)
+            valid_lengths = clipped_lengths.clamp(min=1).unsqueeze(1).float()
+            
+            # 使用 vectorized masking 消除原有的慢速 for 迴圈
+            mask = torch.arange(T, device=s_out.device).unsqueeze(0) < clipped_lengths.unsqueeze(1)
+            mask_float = mask.unsqueeze(1).float()  # [B, 1, T]
+            
+            s_emb = (s_out * mask_float).sum(dim=-1) / valid_lengths  # [B, 256]
         else:
             s_emb = s_out.mean(dim=-1)  # [B, 256]
 
@@ -147,6 +149,9 @@ class SAILER_Model(nn.Module):
         # 3. 多模態融合與多任務預測 (Multimodal Fusion & Multi-task Prediction)
         # -------------------------------------------------------------------
         # 將語音 (256維) 與文字 (1024維) 直接拼接 (Concatenation)，建立 1280 維的聯合表徵空間
+        # 加上 L2 Normalization (迫使向長度單位化)，避免 RoBERTa 的數值規模過大輾壓 Whisper
+        s_emb = F.normalize(s_emb, p=2, dim=-1)
+        t_emb = F.normalize(t_emb, p=2, dim=-1)
         fused_emb = torch.cat([s_emb, t_emb], dim=1)  # 融合特徵: [B, 1280]
 
         # 將融合後的特徵分五路，平行運算分發給各自的任務網路
