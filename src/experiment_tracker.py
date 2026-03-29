@@ -1,4 +1,6 @@
 import os
+import sys
+import shutil
 import json
 import datetime
 import wandb
@@ -31,6 +33,43 @@ class ExperimentTracker:
             sync_tensorboard=True               
         )
         print(f"實驗資料夾與 W&B 已建立: {self.exp_dir}")
+
+        # 4. 註冊全局崩潰攔截器 (Auto Cleanup on Crash)
+        self._setup_exception_hook()
+
+    def _setup_exception_hook(self):
+        """
+        攔截 Python 的未處理錯誤 (Unhandled Exceptions) 與 Ctrl+C (KeyboardInterrupt)。
+        如果程式崩潰，且尚未儲存任何有效權重，則自動清理產生的空資料夾與 W&B 錯誤連線。
+        """
+        original_hook = sys.excepthook
+        
+        def cleanup_hook(exc_type, exc_value, exc_traceback):
+            print(f"\n[ExperimentTracker] 🚨 偵測到程式中止 ({exc_type.__name__})")
+            
+            # 把 TensorBoard 寫入流關閉
+            if hasattr(self, 'writer'):
+                self.writer.close()
+                
+            # 關閉 WandB 並標記為失敗 (Failed)
+            if wandb.run is not None:
+                wandb.finish(exit_code=1)
+                
+            # 判斷是否要刪除本地資料夾 (若 weights_dir 內無任何檔案，代表連 1 個 Epoch 都沒跑完)
+            try:
+                if os.path.exists(self.weights_dir) and len(os.listdir(self.weights_dir)) == 0:
+                    print(f"[ExperimentTracker] 此實驗未產生任何有用權重，啟動清理機制...")
+                    shutil.rmtree(self.exp_dir)
+                    print(f"[ExperimentTracker] 已刪除殘留垃圾資料夾: {self.exp_dir}")
+                else:
+                    print(f"[ExperimentTracker] 保留實驗資料夾，裡面已經存放了儲存好的權重檔案。")
+            except Exception as e:
+                pass
+                
+            # 呼叫原始的 Python 錯誤處理機制，讓錯誤訊息 (Traceback 字串) 原生態地印在終端機上
+            original_hook(exc_type, exc_value, exc_traceback)
+            
+        sys.excepthook = cleanup_hook
 
     def save_config(self, config_dict):
         with open(os.path.join(self.exp_dir, "config.json"), "w") as f:

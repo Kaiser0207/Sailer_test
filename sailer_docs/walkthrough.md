@@ -1,52 +1,101 @@
-# SAILER 系統修正與論文對照紀錄 (Walkthrough)
+# SAILER Best Single System 完整升級報告
 
-您選擇了繼續以 **Whisper (System 3 變體)** 作為主軸，這是一個非常明智的決定！根據論文的 Table 5，**Best Single System + Whisper (Combination)** 確實是單一架構中能達到最高分的組合 (Macro-F1 0.431)。以下是我為您完成的修正與回答：
+本次修改將您的系統從 Table 4「Not Included」升級為論文的 **Best Single System (Table 5)**。
 
-## 1. 驗證集被污染 (Data Leakage) 修復完成
+---
 
-> [!CAUTION]
-> 過去的 `msp_dataset.py` 錯誤地在「驗證集 (Validation/Development)」也套用了與訓練集一樣的**不平衡重新加權 (Distribution Re-weighting)**，導致您的 Valid Loss 完全失真，無法正確反映模型是否正在過擬合 (Overfitting) 少數類別！
+## 修改總覽
 
-**修正結果：**
-在 `src/msp_dataset.py` 中的 `_get_target_distribution` 加入了嚴格的分割判斷，現在重新加權陣列 `$d_{prime}$` \-\- 只會在 `self.split == "Train"` 時生效。測試集與驗證集將會看到最純粹、原始的 Ground Truth 分佈！
+| 檔案 | 改動量 | 涵蓋 GAP |
+|------|--------|---------|
+| `src/sailer_model.py` | 完整重寫 | GAP-5, GAP-2, GAP-1 |
+| `src/msp_dataset.py` | 完整重寫 | GAP-5, GAP-1 |
+| `train.py` | 完整重寫 | GAP-2, GAP-1 |
 
-```diff
--        # Distribution Re-weighting
--        d_prime = d * self.w_norm
--        d_prime_normalized = d_prime / (d_prime.sum() + 1e-8)
-+        # Distribution Re-weighting
-+        if self.split == "Train":
-+            d_prime = d * self.w_norm
-+            d_prime_normalized = d_prime / (d_prime.sum() + 1e-8)
-+        else:
-+            d_prime_normalized = d
+---
+
+## GAP-5: Masked Temporal Average ✅
+
+**問題**：原本語音特徵的 `mean()` 把 padding 的 0 也算進去了，稀釋了有意義的語音資訊。
+
+**修復**：
+- `msp_dataset.py`：計算並回傳 `effective_length`（padding 前的真實幀數）
+- `sailer_model.py`：`forward()` 接收 `lengths` 參數，語音特徵只對有效幀做 mean
+
+```python
+# 新寫法：只計算有效區域
+for i in range(s_out.shape[0]):
+    actual_len = min(lengths[i].item(), s_out.shape[2])
+    mean_list.append(s_out[i, :, :actual_len].mean(dim=-1))
 ```
 
-## 2. `extract_features.py` 審查與修正 (極為重要！)
+---
 
-我幫您檢查了 `scripts/extract_features.py`，您的核心想法 **完全符合** 論文中對於 Whisper 特徵萃取的規定（使用 `Whisper Large-V3` 進行特徵預處理），但在實作上隱藏了一個可能摧毀整個模型的「未爆彈」。
+## GAP-2: RoBERTa Learnable Weighted Average ✅
 
-> [!WARNING]
-> 本來的程式碼使用 `sf.read(path)` 直接讀音檔。雖然您在處理器加了 `sampling_rate=16000`，但 Huggingface 的 `processor` **並不會幫您轉檔/重採樣 (Resample)**！如果您的資料庫（如 MSP-Podcast）中有一部分音檔被存成 `44.1kHz`，這些音檔經過 processor 後就會變成全都是雜訊的錯亂頻譜。
+**問題**：原本只取 RoBERTa 最後一層，丟失了低層的語法資訊。
 
-**修正結果：**
-我已將您的特徵提取指令強制作廢原先的讀取方式，改使用業界標準的 `librosa` 來進行重採樣保障：
-```diff
--            speech, sr = sf.read(path)
--            if speech.ndim > 1: speech = speech.mean(axis=1)
-+            import librosa
-+            speech, sr = librosa.load(path, sr=16000)
+**修復**：
+- `train.py`：呼叫 RoBERTa 時傳 `output_hidden_states=True`，取得所有 25 層
+- `sailer_model.py`：新增 `self.text_layer_weights = nn.Parameter(torch.ones(25)/25)`，用 softmax 做 learnable weighted average
+
+```python
+stacked = torch.stack(t_hidden_states, dim=0)         # [25, B, T, 1024]
+norm_weights = torch.softmax(self.text_layer_weights, dim=0)
+t_seq = (norm_weights.view(-1, 1, 1, 1) * stacked).sum(dim=0)  # [B, T, 1024]
 ```
-有了這層保護，無論資料集的原始頻率多混亂，您輸出的 `Whisper_Features_30s` 都會是論文要求的完美的 `16kHz` Log-Mel 頻譜特徵！
 
-## 3. 論文對照檢查一覽表
+---
 
-針對您目前的「Whisper 模型主軸」版本，目前與論文 SAILER 系統的契合度如下：
+## GAP-1: Multi-task Learning ✅
 
-| 技術點 | 目前狀態 | 說明與評價 |
-| ---- | ---- | ---- |
-| **Speech Backbone** | ✅ 符合 (System 3) | 使用 Whisper Encoder 提取特徵，不微調，這是論文中 System 3 的神兵利器，省下大量 GPU 資源同時效能極高。 |
-| **Learning Objective** | ✅ 符合 | 使用 `KLDivLoss` 軟標籤。 |
-| **Data Augmentation** | ✅ 符合 | 完美實作了論文中的「混合分佈平均標籤」與「Silence/Overlap」增強邏輯！ |
-| **Distribution Re-weighting** | ✅ 已修復 | 已限制僅於 Train 進行加權懲罰。 |
-| **Multi-task Learning** | 🟡 缺乏 | 您的架構目前只預測 `num_classes=8`，缺了 Arousal/Valence/Dominance 跟次要情緒。*(如果未來想再拉高一點點分數，加個 Regression Layer 即可)* |
+**問題**：原本只有 1 個輸出頭 (Primary Emotion 8 類)，對應 Table 4「Not Included」。
+
+**修復**：新增 4 個輸出頭，對應官方碼 `whisper_emotion.py:198-229`：
+
+| 輸出頭 | 類型 | 維度 | Loss |
+|--------|------|------|------|
+| Primary Emotion | 分類 | 8 | KLDivLoss |
+| Secondary Emotion | 分類 | 17 | KLDivLoss |
+| Arousal | 回歸 | 1 (Sigmoid) | MSELoss |
+| Valence | 回歸 | 1 (Sigmoid) | MSELoss |
+| Dominance | 回歸 | 1 (Sigmoid) | MSELoss |
+
+**Total Loss** = `loss_primary + loss_secondary + loss_avd`
+
+### Dataset 變更：
+- 新增 17 類 secondary emotion 分佈（從 `labels_detailed.csv` 的 `EmoClass_Major` 統計）
+- 新增 AVD 標籤（從 `labels_consensus.csv` 的 `EmoAct/EmoVal/EmoDom`，正規化到 [0,1]）
+- 回傳格式：`(w_feat, t_ids, t_mask, label_dist, secondary_dist, avd_target, effective_length)`
+
+---
+
+## Dry-run 驗證結果 ✅
+
+```
+Model created successfully!
+Primary logits:   torch.Size([4, 8])
+Secondary logits: torch.Size([4, 17])
+Arousal:          torch.Size([4, 1])
+Valence:          torch.Size([4, 1])
+Dominance:        torch.Size([4, 1])
+Primary Loss:   0.3263
+Secondary Loss: 0.4135
+AVD Loss:       0.1185
+Total Loss:     0.8582
+All checks passed! ✅
+```
+
+---
+
+## GAP 完整狀態
+
+| GAP | 狀態 |
+|-----|------|
+| GAP-1 Multi-task Learning | ✅ Done |
+| GAP-2 RoBERTa Weighted Average | ✅ Done |
+| GAP-3 Learning Rate 0.0005 | ✅ Done (user) |
+| GAP-4 max_source_positions=750 | ✅ Done |
+| GAP-5 Masked Temporal Average | ✅ Done |
+| GAP-6 Audio Mixing [0,100] | ✅ Done |
+| GAP-7 pa probability | ⬜ Skip (合理預設) |
