@@ -10,16 +10,23 @@ from tqdm import tqdm
 class MSP_Podcast_Dataset(Dataset):
     """
     MSP-Podcast 語音情感資料集裝載器 (PyTorch Dataset)。
-    負責讀取、對齊特徵 (15s Whisper 聲紋與 128-token RoBERTa 文本)，
-    並在 Train 階段執行資料增強 (Audio Mixing) 與動態標籤平滑 (Annotation Dropout)。
+    負責讀取、對齊特徵，並在 Train 階段執行資料增強 (Audio Mixing) 與動態標籤平滑 (Annotation Dropout)。
+    
+    支援兩種模式：
+    - use_cached_features=True:  從預提取的 Whisper Encoder 特徵直接載入 (V3 極速模式)
+    - use_cached_features=False: 從 Mel 頻譜載入，訓練時即時過 Whisper Encoder (V2 原始模式)
     """
-    def __init__(self, data_dir, split="Train", roberta_tokenizer=None, apply_aug=True):
+    def __init__(self, data_dir, split="Train", roberta_tokenizer=None, apply_aug=True, use_cached_features=True):
         self.data_dir = data_dir
         self.split = split
         self.roberta_tokenizer = roberta_tokenizer
         self.apply_aug = apply_aug and split == "Train"
+        self.use_cached_features = use_cached_features
         
-        self.feat_dir = os.path.join(data_dir, "Whisper_Features_15s")
+        # V3 預提取特徵目錄 / V2 原始 Mel 目錄
+        self.cached_feat_dir = os.path.join(data_dir, "Whisper_Encoder_Features")
+        self.mel_feat_dir = os.path.join(data_dir, "Whisper_Features_15s")
+        self.feat_dir = self.cached_feat_dir if use_cached_features else self.mel_feat_dir
         self.transcripts_dir = os.path.join(data_dir, "Transcripts")
         
         self.consensus_path = os.path.join(data_dir, "Labels", "labels_consensus.csv")
@@ -196,15 +203,16 @@ class MSP_Podcast_Dataset(Dataset):
         """
         v = votes.copy()
         
-        # 標註機率丟棄 (Annotation Dropout)：防止模型對單一主導情緒過擬合
-        total_votes = int(v.sum())
-        n_drop = max(1, int(total_votes * 0.2))
-        for _ in range(n_drop):
-            drop_pool = [i for i in self.majority_classes if v[i] > 0]
-            if not drop_pool:
-                break
-            drop_idx = np.random.choice(drop_pool)
-            v[drop_idx] -= 1.0
+        # 標註機率丟棄 (Annotation Dropout)：僅在訓練階段執行，防止模型對單一主導情緒過擬合
+        if is_training:
+            total_votes = int(v.sum())
+            n_drop = max(1, int(total_votes * 0.2))
+            for _ in range(n_drop):
+                drop_pool = [i for i in self.majority_classes if v[i] > 0]
+                if not drop_pool:
+                    break
+                drop_idx = np.random.choice(drop_pool)
+                v[drop_idx] -= 1.0
 
         d = v / (v.sum() + 1e-8)
         
@@ -226,79 +234,136 @@ class MSP_Podcast_Dataset(Dataset):
 
     def __getitem__(self, idx):
         record = self.data_records[idx]
-        w_feat = torch.load(record["feat_path"]).float()  
         label_dist = self._get_target_distribution(record["votes"], self.apply_aug)
         secondary_dist = self._get_secondary_distribution(record["secondary_votes"])
         avd_target = torch.tensor(record["avd"], dtype=torch.float32)
         text = record["text"]
-        
-        effective_length = w_feat.shape[-1]
-        
-        # ==========================================
-        # 資料增強 (Data Augmentation) - Audio Mixing 
-        # 每當遇到多數情緒 (多半是 Neutral 或 Happy) 時，有 50% 機率強行混入一段少數情緒 (Fear, Disgust)
-        # ==========================================
-        if self.apply_aug and record['consensus_label'] in self.majority_classes and random.random() < 0.5:
-            min_record = random.choices(self.minority_records, weights=self.record_weights, k=1)[0]
-            min_feat = torch.load(min_record["feat_path"]).float()
-            min_dist = self._get_target_distribution(min_record["votes"], self.apply_aug)
-            min_sec_dist = self._get_secondary_distribution(min_record["secondary_votes"])
-            min_avd = torch.tensor(min_record["avd"], dtype=torch.float32)
 
-            if random.random() < 0.5:
-                feat_first, feat_second = w_feat, min_feat
-                text_first, text_second = text, min_record["text"]
-            else:
-                feat_first, feat_second = min_feat, w_feat
-                text_first, text_second = min_record["text"], text
+        if self.use_cached_features:
+            # ==========================================
+            # V3 模式：載入預提取的 Whisper Encoder 特徵
+            # 特徵形狀: [T_valid, 1280]，已經是 Encoder 輸出
+            # ==========================================
+            w_feat = torch.load(record["feat_path"], weights_only=True).float()
+            # w_feat shape: [T_valid, 1280]
+            effective_length = w_feat.shape[0]  # 時間軸在 dim=0
 
-            mix_type = random.choice(["silence", "overlap"])
-            
-            if mix_type == "silence":
-                silence_len = random.randint(0, 100)
-                mel_bins = feat_first.shape[0] 
-                silence = torch.zeros((mel_bins, silence_len), dtype=feat_first.dtype)
-                mixed_feat = torch.cat([feat_first, silence, feat_second], dim=-1)
-            else:
-                overlap_len = random.randint(0, 100)
-                if overlap_len > 0 and feat_first.shape[-1] > overlap_len and feat_second.shape[-1] > overlap_len:
-                    front = feat_first[:, :-overlap_len]
-                    overlap_zone = (feat_first[:, -overlap_len:] + feat_second[:, :overlap_len]) / 2.0
-                    back = feat_second[:, overlap_len:]
-                    mixed_feat = torch.cat([front, overlap_zone, back], dim=-1)
+            # Audio Mixing (特徵空間版本)
+            if self.apply_aug and record['consensus_label'] in self.majority_classes and random.random() < 0.5:
+                min_record = random.choices(self.minority_records, weights=self.record_weights, k=1)[0]
+                min_feat = torch.load(min_record["feat_path"], weights_only=True).float()
+                min_dist = self._get_target_distribution(min_record["votes"], self.apply_aug)
+                min_sec_dist = self._get_secondary_distribution(min_record["secondary_votes"])
+                min_avd = torch.tensor(min_record["avd"], dtype=torch.float32)
+
+                if random.random() < 0.5:
+                    feat_first, feat_second = w_feat, min_feat
+                    text_first, text_second = text, min_record["text"]
                 else:
-                    mixed_feat = torch.cat([feat_first, feat_second], dim=-1)
+                    feat_first, feat_second = min_feat, w_feat
+                    text_first, text_second = min_record["text"], text
 
-            w_feat = mixed_feat
-            effective_length = w_feat.shape[-1]  
+                # 特徵空間的 silence/overlap (dim=0 是時間軸)
+                # Whisper stride=2, 200 mel frames -> 100 encoder frames
+                mix_type = random.choice(["silence", "overlap"])
+                if mix_type == "silence":
+                    silence_len = random.randint(0, 100)  # encoder 空間的 100 步 ≈ 2 秒
+                    silence = torch.zeros((silence_len, feat_first.shape[-1]), dtype=feat_first.dtype)
+                    w_feat = torch.cat([feat_first, silence, feat_second], dim=0)
+                else:
+                    overlap_len = random.randint(0, 100)
+                    if overlap_len > 0 and feat_first.shape[0] > overlap_len and feat_second.shape[0] > overlap_len:
+                        front = feat_first[:-overlap_len, :]
+                        overlap_zone = (feat_first[-overlap_len:, :] + feat_second[:overlap_len, :]) / 2.0
+                        back = feat_second[overlap_len:, :]
+                        w_feat = torch.cat([front, overlap_zone, back], dim=0)
+                    else:
+                        w_feat = torch.cat([feat_first, feat_second], dim=0)
 
-            # 文本、標籤機率均等地按 1:1 比例混合
-            text = text_first + " </s> " + text_second
+                effective_length = w_feat.shape[0]
+                text = text_first + " </s> " + text_second
+                label_dist = (label_dist + min_dist) / 2.0
+                secondary_dist = (secondary_dist + min_sec_dist) / 2.0
+                avd_target = (avd_target + min_avd) / 2.0
 
-            label_dist = (label_dist + min_dist) / 2.0
-            secondary_dist = (secondary_dist + min_sec_dist) / 2.0
-            avd_target = (avd_target + min_avd) / 2.0
+            # 截斷至 750 步上限 (15 秒 / stride 2) 並補零統一長度
+            max_encoder_frames = 750
+            effective_length = min(effective_length, max_encoder_frames)
 
-        target_frames = 1500
-        current_frames = w_feat.shape[-1]
+            if w_feat.shape[0] > max_encoder_frames:
+                w_feat = w_feat[:max_encoder_frames, :]
+            elif w_feat.shape[0] < max_encoder_frames:
+                pad_len = max_encoder_frames - w_feat.shape[0]
+                w_feat = F.pad(w_feat, (0, 0, 0, pad_len))  # pad 時間軸
 
-        effective_length = min(effective_length, target_frames)
-        
-        if current_frames > target_frames:
-            w_feat = w_feat[:, :target_frames]
-        elif current_frames < target_frames:
-            pad_len = target_frames - current_frames
-            w_feat = F.pad(w_feat, (0, pad_len))
+            # 轉置為 [1280, 750] 方便後續 Conv1d 處理
+            w_feat = w_feat.transpose(0, 1)
+
+        else:
+            # ==========================================
+            # V2 模式：載入原始 Mel 頻譜，訓練時即時過 Whisper Encoder
+            # ==========================================
+            w_feat = torch.load(record["feat_path"], weights_only=False).float()
+            effective_length = w_feat.shape[-1]
+
+            if self.apply_aug and record['consensus_label'] in self.majority_classes and random.random() < 0.5:
+                min_record = random.choices(self.minority_records, weights=self.record_weights, k=1)[0]
+                min_feat = torch.load(min_record["feat_path"], weights_only=False).float()
+                min_dist = self._get_target_distribution(min_record["votes"], self.apply_aug)
+                min_sec_dist = self._get_secondary_distribution(min_record["secondary_votes"])
+                min_avd = torch.tensor(min_record["avd"], dtype=torch.float32)
+
+                if random.random() < 0.5:
+                    feat_first, feat_second = w_feat, min_feat
+                    text_first, text_second = text, min_record["text"]
+                else:
+                    feat_first, feat_second = min_feat, w_feat
+                    text_first, text_second = min_record["text"], text
+
+                mix_type = random.choice(["silence", "overlap"])
+                if mix_type == "silence":
+                    silence_len = random.randint(0, 200)
+                    mel_bins = feat_first.shape[0]
+                    silence = torch.zeros((mel_bins, silence_len), dtype=feat_first.dtype)
+                    mixed_feat = torch.cat([feat_first, silence, feat_second], dim=-1)
+                else:
+                    overlap_len = random.randint(0, 200)
+                    if overlap_len > 0 and feat_first.shape[-1] > overlap_len and feat_second.shape[-1] > overlap_len:
+                        front = feat_first[:, :-overlap_len]
+                        overlap_zone = (feat_first[:, -overlap_len:] + feat_second[:, :overlap_len]) / 2.0
+                        back = feat_second[:, overlap_len:]
+                        mixed_feat = torch.cat([front, overlap_zone, back], dim=-1)
+                    else:
+                        mixed_feat = torch.cat([feat_first, feat_second], dim=-1)
+
+                w_feat = mixed_feat
+                effective_length = w_feat.shape[-1]
+                text = text_first + " </s> " + text_second
+                label_dist = (label_dist + min_dist) / 2.0
+                secondary_dist = (secondary_dist + min_sec_dist) / 2.0
+                avd_target = (avd_target + min_avd) / 2.0
+
+            max_audio_frames = 1500
+            whisper_input_frames = 3000
+            effective_length = min(effective_length, max_audio_frames)
+            current_frames = w_feat.shape[-1]
+
+            if current_frames > max_audio_frames:
+                w_feat = w_feat[:, :max_audio_frames]
+                current_frames = max_audio_frames
+            if current_frames < whisper_input_frames:
+                pad_len = whisper_input_frames - current_frames
+                w_feat = F.pad(w_feat, (0, pad_len))
 
         t_in = self.roberta_tokenizer(
             text, padding='max_length', max_length=128,
             truncation=True, return_tensors="pt"
         )
-        
+
         return (
-            w_feat, 
-            t_in.input_ids.squeeze(0), 
-            t_in.attention_mask.squeeze(0), 
+            w_feat,
+            t_in.input_ids.squeeze(0),
+            t_in.attention_mask.squeeze(0),
             label_dist,
             secondary_dist,
             avd_target,

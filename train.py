@@ -14,7 +14,6 @@ import random
 
 from src.experiment_tracker import ExperimentTracker
 
-# (原手寫 seed_everything 已被 transformers.set_seed 取代)
 from src.msp_dataset import MSP_Podcast_Dataset
 from src.sailer_model import SAILER_Model
 
@@ -28,6 +27,7 @@ def main():
     # ==========================================
     parser = argparse.ArgumentParser(description="SAILER Training Script")
     parser.add_argument("--config", type=str, default="configs/default_config.json", help="Path to configuration JSON file")
+    parser.add_argument("--resume", action="store_true", help="Resume training from the latest checkpoint")
     args = parser.parse_args()
 
     # 讀取外部 JSON Config 檔案
@@ -37,73 +37,72 @@ def main():
     # 採用正規套件鎖定一切亂數，確保實驗結果絕對可重現 (Reproducibility)
     set_seed(config.get("seed", 42))
 
-    tracker = ExperimentTracker(experiment_name=config["model_name"])
+    # 處理斷點續傳路徑
+    resume_dir = None
+    if args.resume:
+        resume_dir = ExperimentTracker.find_latest_experiment(config["model_name"])
+    
+    tracker = ExperimentTracker(experiment_name=config["model_name"], resume_dir=resume_dir)
     tracker.save_config(config)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    data_dir = config["data_dir"] 
+    data_dir = config["data_dir"]
+    use_cached = config.get("use_cached_features", True)
 
     # ==========================================
-    # 2. 載入預估模型架構 (Load Pre-trained Encoders)
-    # 策略: 載入 Whisper 與 RoBERTa，並將其神經網絡「完全凍結 (Frozen)」，專注訓練 SAILER 融合層
+    # 2. 載入預訓練模型架構 (Load Pre-trained Encoders)
     # ==========================================
     r_tokenizer = RobertaTokenizer.from_pretrained("roberta-large")
 
-    # 載入 Whisper 編碼器 
-    whisper_enc = WhisperModel.from_pretrained(
-        "openai/whisper-large-v3"
-    ).encoder.to(device)
+    # 載入 Whisper 編碼器 (僅在 V2 模式時需要，V3 已預提取特徵則跳過)
+    if use_cached:
+        whisper_enc = None
+        print("[V3 Mode] Whisper Encoder 已跳過載入，使用預提取特徵。")
+    else:
+        whisper_enc = WhisperModel.from_pretrained(
+            "openai/whisper-large-v3"
+        ).encoder.to(device)
+        whisper_enc.eval()
+        for p in whisper_enc.parameters():
+            p.requires_grad = False
     
     roberta_model = RobertaModel.from_pretrained("roberta-large").to(device)
 
-    # 迴圈設定為 eval 模式，並停止計算計算圖梯度 (requires_grad = False) 以極大化釋放顯存
-    for m in [whisper_enc, roberta_model]:
-        m.eval()
-        for p in m.parameters():
-            p.requires_grad = False
+    # RoBERTa 設為 eval 並凍結權重
+    roberta_model.eval()
+    for p in roberta_model.parameters():
+        p.requires_grad = False
 
     # ==========================================
     # 3. 準備資料集加載器 (DataLoader Pipeline)
     # Train: 套用資料增強 (Audio Mixing) 與動態過採樣，增加資料多樣性保護少數群體
     # Validation: 純淨資料供給，嚴格依賴自然資料分佈作為評估基準
     # ==========================================
-    train_dataset = MSP_Podcast_Dataset(data_dir, split="Train", roberta_tokenizer=r_tokenizer, apply_aug=True)
+    train_dataset = MSP_Podcast_Dataset(data_dir, split="Train", roberta_tokenizer=r_tokenizer, apply_aug=True, use_cached_features=use_cached)
     train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True, num_workers=4)
 
-    val_dataset = MSP_Podcast_Dataset(data_dir, split="Development", roberta_tokenizer=r_tokenizer, apply_aug=False)
+    val_dataset = MSP_Podcast_Dataset(data_dir, split="Development", roberta_tokenizer=r_tokenizer, apply_aug=False, use_cached_features=use_cached)
     val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False, num_workers=4)
 
-    # ==========================================
-    # 4. 初始化自定義 SAILER 模型與訓練組件 (Model Initialization)
-    # ==========================================
     model = SAILER_Model(
         num_classes=config["num_classes"],
         secondary_class_num=config["secondary_class_num"],
-        dropout_rate=0.2
+        dropout_rate=config.get("dropout_rate", 0.2)
     ).to(device)
 
-    # 引入 torch.compile，加速訓練速度
-    try:
-        print("正在啟動編譯優化 (torch.compile)...")
-        model = torch.compile(model)
-        print("編譯成功！")
-    except Exception as e:
-        print(f"編譯失敗，將使用一般動態圖模式訓練。錯誤: {e}")
-
-    # 定義多任務損失函數 (Multi-task Loss Functions)
-    # 針對軟標籤(Soft labels)分佈預測使用 KL Divergence，針對連續值則採用均方差 MSE
+    # ==========================================
+    # 4.1 定義訓練組件 (Criterion, Optimizer, Scheduler)
+    # ==========================================
     criterion_primary = nn.KLDivLoss(reduction='batchmean')
     criterion_secondary = nn.KLDivLoss(reduction='batchmean')
     criterion_avd = nn.MSELoss()
     
-    # 加入 weight_decay=1e-4 以提供輕微正規化，對抗過擬合
     optimizer = torch.optim.AdamW(
         model.parameters(), 
         lr=config["learning_rate"], 
         weight_decay=config.get("weight_decay", 1e-4)
     )
     
-    # 加入 Cosine Learning Rate Scheduler (附帶 Warmup)
     total_steps = len(train_loader) * config["epochs"]
     warmup_steps = int(total_steps * config.get("warmup_ratio", 0.1))
     scheduler = get_cosine_schedule_with_warmup(
@@ -113,32 +112,75 @@ def main():
     )
     
     scaler = torch.amp.GradScaler('cuda')
-
+    start_epoch = 0
     best_f1 = 0.0
     best_min_map = 0.0
 
     # ==========================================
+    # 4.2 執行斷點續傳載入 (Resume Checkpoint)
+    # ==========================================
+    checkpoint_path = os.path.join(tracker.weights_dir, "checkpoint_latest.pth")
+    if args.resume and os.path.exists(checkpoint_path):
+        tracker.logger.info(f"正在從斷點載入狀態: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        
+        # 載入模型權重 (處理 torch.compile 產生的 _orig_mod 前綴)
+        state_dict = checkpoint['model_state_dict']
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            name = k.replace("_orig_mod.", "") 
+            new_state_dict[name] = v
+            
+        model.load_state_dict(new_state_dict)
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if 'scaler_state_dict' in checkpoint:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            
+        start_epoch = checkpoint['epoch'] + 1
+        best_f1 = checkpoint.get('best_f1', 0.0)
+        best_min_map = checkpoint.get('best_min_map', 0.0)
+        tracker.logger.info(f"成功恢復進度！將從 Epoch {start_epoch + 1} 開始訓練 (當前最佳 F1: {best_f1:.4f})")
+
+    # ==========================================
+    # 4.3 啟動編譯優化 (torch.compile)
+    # ==========================================
+    try:
+        print("正在啟動編譯優化 (torch.compile)...")
+        model = torch.compile(model)
+        print("編譯成功！")
+    except Exception as e:
+        print(f"編譯失敗，將使用一般動態圖模式訓練。錯誤: {e}")
+
+    # ==========================================
     # 4.5 Sanity Check (防呆乾跑驗證機制)
-    # 在漫長的訓練開始前，強行過一次驗證集前向傳播，若有 Shape 不合會直接噴錯攔截。
     # ==========================================
     tracker.logger.info("啟動 Sanity Check (抽取一筆驗證資料預跑)...")
     model.eval()
     with torch.no_grad():
         for batch in val_loader:
             w_feat, t_ids, t_mask, label_dists, sec_dists, avd_targets, lengths = [b.to(device) for b in batch]
-            if w_feat.shape[-1] > 0:
-                with torch.amp.autocast('cuda'):
+            with torch.amp.autocast('cuda'):
+                if use_cached:
+                    # V3: w_feat 已是 Whisper Encoder 輸出 [B, 1280, 750]，直接遞給 speech_conv
+                    w_seq = w_feat.transpose(1, 2)  # [B, 750, 1280]
+                else:
+                    # V2: w_feat 是 Mel [B, 128, 3000]，需過 Whisper Encoder
                     w_seq = whisper_enc(w_feat).last_hidden_state
-                    roberta_out = roberta_model(input_ids=t_ids, attention_mask=t_mask, output_hidden_states=True)
-                    model(w_seq, roberta_out.hidden_states, t_mask, lengths)
+                roberta_out = roberta_model(input_ids=t_ids, attention_mask=t_mask, output_hidden_states=True)
+                # V2 模式下 lengths 是 Mel 幀數，需除以 2 對齊 Whisper Encoder stride
+                enc_lengths = lengths if use_cached else lengths // 2
+                model(w_seq, roberta_out.hidden_states, t_mask, enc_lengths)
             break
-    tracker.logger.info("✅ Sanity Check 通過！網路無 Shape Mismatch，正式進入訓練迴圈！")
+    tracker.logger.info("Sanity Check 通過！網路無 Shape Mismatch，正式進入訓練迴圈！")
 
     # ==========================================
     # 5. 主訓練迴圈 (Main Epoch Execution)
     # ==========================================
-    for epoch in range(config["epochs"]):
-        logger.info(f"====== [{epoch+1}/{config['epochs']}] 啟動 Epoch 訓練 ======")
+    for epoch in range(start_epoch, config["epochs"]):
+        tracker.logger.info(f"====== [{epoch+1}/{config['epochs']}] 啟動 Epoch 訓練 ======")
         model.train()
         total_train_loss = 0
 
@@ -151,13 +193,19 @@ def main():
             with torch.amp.autocast('cuda'):
                 # ==== 階段一：預訓練前端提取 (No Grad Context) ====
                 with torch.no_grad():
-                    w_seq = whisper_enc(w_feat).last_hidden_state  
+                    if use_cached:
+                        # V3: w_feat 已是 Encoder 輸出 [B, 1280, 750]
+                        w_seq = w_feat.transpose(1, 2)  # [B, 750, 1280]
+                    else:
+                        # V2: 即時過 Whisper Encoder
+                        w_seq = whisper_enc(w_feat).last_hidden_state
                     roberta_out = roberta_model(input_ids=t_ids, attention_mask=t_mask, output_hidden_states=True)
                     t_hidden_states = roberta_out.hidden_states  
                 
                 # ==== 階段二：SAILER 特徵融合網絡 (Train Context) ====
+                enc_lengths = lengths if use_cached else lengths // 2
                 primary_logits, secondary_logits, arousal, valence, dominance = model(
-                    w_seq, t_hidden_states, t_mask, lengths
+                    w_seq, t_hidden_states, t_mask, enc_lengths
                 )
 
                 # 計算 5 大任務的 Loss 差異
@@ -171,6 +219,8 @@ def main():
 
             # ==== 階段三：傳播梯度更新 ====
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             
@@ -200,12 +250,15 @@ def main():
                 w_feat, t_ids, t_mask, label_dists, sec_dists, avd_targets, lengths = [b.to(device) for b in batch]
 
                 with torch.amp.autocast('cuda'):
-                    w_seq = whisper_enc(w_feat).last_hidden_state
+                    if use_cached:
+                        w_seq = w_feat.transpose(1, 2)
+                    else:
+                        w_seq = whisper_enc(w_feat).last_hidden_state
                     roberta_out = roberta_model(input_ids=t_ids, attention_mask=t_mask, output_hidden_states=True)
                     t_hidden_states = roberta_out.hidden_states
 
                     primary_logits, secondary_logits, arousal, valence, dominance = model(
-                        w_seq, t_hidden_states, t_mask, lengths
+                        w_seq, t_hidden_states, t_mask, lengths if use_cached else lengths // 2
                     )
                     
                     val_loss_primary = criterion_primary(F.log_softmax(primary_logits, dim=-1), label_dists)
@@ -262,7 +315,7 @@ def main():
         report += classification_report(all_labels, all_preds, labels=list(range(8)), target_names=emotion_names, zero_division=0)
         report += f"\n{'='*45}"
         
-        logger.info(report)
+        tracker.logger.info(report)
 
         tracker.log_metrics(epoch, avg_train_loss, avg_val_loss, val_acc)
         wandb.log(log_dict, step=epoch)
@@ -272,13 +325,27 @@ def main():
         # ==========================================
         if min_map > best_min_map:
             best_min_map = min_map
-            logger.info(f"少數類別準確度提升 (Min. mAP: {min_map:.4f}) ")
+            tracker.logger.info(f"少數類別準確度提升 (Min. mAP: {min_map:.4f}) ")
             torch.save(model.state_dict(), os.path.join(tracker.weights_dir, "best_model_min_map.pth"))
 
         if val_macro_f1 > best_f1:
             best_f1 = val_macro_f1
-            logger.info(f"綜合泛化能力提升 (Macro F1: {val_macro_f1:.4f}) ")
+            tracker.logger.info(f"綜合泛化能力提升 (Macro F1: {val_macro_f1:.4f}) ")
             torch.save(model.state_dict(), os.path.join(tracker.weights_dir, "best_model_f1.pth"))
+
+        # ==========================================
+        # 8. 保存最新斷點 (Latest Checkpoint for Resume)
+        # ==========================================
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'best_f1': best_f1,
+            'best_min_map': best_min_map
+        }, checkpoint_path)
+        tracker.logger.info(f"Epoch {epoch+1} 狀態 (含 Best 紀錄) 已備份至: {checkpoint_path}")
 
     tracker.close()
 

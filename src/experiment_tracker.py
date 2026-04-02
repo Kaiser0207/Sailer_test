@@ -11,10 +11,19 @@ from sklearn.metrics import confusion_matrix
 from torch.utils.tensorboard import SummaryWriter
 
 class ExperimentTracker:
-    def __init__(self, experiment_name="SAILER_MSP"):
-        # 1. 建立時間戳記資料夾
-        now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.exp_dir = f"experiments/{now}_{experiment_name}"
+    def __init__(self, experiment_name="SAILER_MSP", resume_dir=None):
+        """
+        實驗追蹤器。支援建立新實驗或從舊實驗恢復。
+        :param resume_dir: 若提供路徑，則會使用原資料夾而非建立新資料夾。
+        """
+        if resume_dir:
+            self.exp_dir = resume_dir
+            self.logger_msg = f"恢復現有的實驗資料夾: {self.exp_dir}"
+        else:
+            # 1. 建立時間戳記資料夾
+            now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.exp_dir = f"experiments/{now}_{experiment_name}"
+            self.logger_msg = f"建立新實驗資料夾: {self.exp_dir}"
         
         self.weights_dir = os.path.join(self.exp_dir, "weights")
         self.plots_dir = os.path.join(self.exp_dir, "plots")
@@ -24,23 +33,50 @@ class ExperimentTracker:
         os.makedirs(self.plots_dir, exist_ok=True)
         os.makedirs(self.logs_dir, exist_ok=True)
         
-        # 2. 啟動 TensorBoard
-        self.writer = SummaryWriter(log_dir=self.logs_dir)
+        # 2. WandB ID 持久化 (為了斷點續傳能對上同一個 Run)
+        wandb_id_file = os.path.join(self.logs_dir, "wandb_id.txt")
+        run_id = None
+        if resume_dir and os.path.exists(wandb_id_file):
+            with open(wandb_id_file, "r") as f:
+                run_id = f.read().strip()
 
-        # 3. 啟動 Weights & Biases (雲端同步)
+        # 3. 啟動 Weights & Biases
         wandb.init(
             project="SAILER_Emotion_Recognition",
-            name=f"{now}_{experiment_name}",      
+            name=os.path.basename(self.exp_dir),      
+            id=run_id,
+            resume="allow" if run_id else None,
             sync_tensorboard=True               
         )
         
-        # 5. 建立本地日誌系統 (Professional Logging)
+        # 若是新實驗，保存這組 ID
+        if not run_id:
+            with open(wandb_id_file, "w") as f:
+                f.write(wandb.run.id)
+
+        # 4. 啟動 TensorBoard
+        self.writer = SummaryWriter(log_dir=self.logs_dir)
+        
+        # 5. 建立本地日誌系統
         self.logger = self._setup_logging()
-        self.logger.info(f"實體實驗資料夾建立完成: {self.exp_dir}")
+        self.logger.info(self.logger_msg)
         self.logger.info(f"所有的訓練紀錄將會同步保存至: {os.path.join(self.logs_dir, 'train.log')}")
 
-        # 4. 註冊全局崩潰攔截器 (Auto Cleanup on Crash)
+        # 6. 註冊格式化例外攔截器 (Auto Cleanup on Crash)
         self._setup_exception_hook()
+
+    @staticmethod
+    def find_latest_experiment(experiment_name):
+        """
+        在 experiments/ 目錄中尋找與 experiment_name 匹配且時間戳最晚的資料夾。
+        """
+        if not os.path.exists("experiments"):
+            return None
+        dirs = [d for d in os.listdir("experiments") if d.endswith(experiment_name) and os.path.isdir(os.path.join("experiments", d))]
+        if not dirs:
+            return None
+        dirs.sort(reverse=True)
+        return os.path.join("experiments", dirs[0])
 
     def _setup_logging(self):
         """
@@ -113,7 +149,7 @@ class ExperimentTracker:
     def save_config(self, config_dict):
         with open(os.path.join(self.exp_dir, "config.json"), "w") as f:
             json.dump(config_dict, f, indent=4)
-        wandb.config.update(config_dict)    
+        wandb.config.update(config_dict, allow_val_change=True)    
 
     def log_metrics(self, epoch, train_loss, val_loss, val_acc):
         self.writer.add_scalars('Loss', {'Train': train_loss, 'Val': val_loss}, epoch)
