@@ -17,6 +17,10 @@ from src.experiment_tracker import ExperimentTracker
 from src.msp_dataset import MSP_Podcast_Dataset
 from src.sailer_model import SAILER_Model
 
+def get_clean_state_dict(model):
+    state_dict = model.state_dict()
+    return {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
 def main():
     """
     SAILER 系統核心訓練迴圈 
@@ -37,12 +41,12 @@ def main():
     # 採用正規套件鎖定一切亂數，確保實驗結果絕對可重現 (Reproducibility)
     set_seed(config.get("seed", 42))
 
-    # 處理斷點續傳路徑
+    # 2. 實驗追蹤器
     resume_dir = None
     if args.resume:
         resume_dir = ExperimentTracker.find_latest_experiment(config["model_name"])
     
-    tracker = ExperimentTracker(experiment_name=config["model_name"], resume_dir=resume_dir)
+    tracker = ExperimentTracker(experiment_name=config["model_name"], resume_dir=resume_dir, config=config)
     tracker.save_config(config)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -115,6 +119,7 @@ def main():
     start_epoch = 0
     best_f1 = 0.0
     best_min_map = 0.0
+    no_improve_count = 0 # ✨ 早停計數器
 
     # ==========================================
     # 4.2 執行斷點續傳載入 (Resume Checkpoint)
@@ -124,14 +129,17 @@ def main():
         tracker.logger.info(f"正在從斷點載入狀態: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         
-        # 載入模型權重 (處理 torch.compile 產生的 _orig_mod 前綴)
-        state_dict = checkpoint['model_state_dict']
-        new_state_dict = {}
-        for k, v in state_dict.items():
-            name = k.replace("_orig_mod.", "") 
-            new_state_dict[name] = v
-            
-        model.load_state_dict(new_state_dict)
+        # 載入模型權重
+        model.load_state_dict(checkpoint['model_state_dict']) # 這裡存的時候已經清理過了，直接載入即可
+        
+        # 重點：使用記錄的 total_steps 重建 scheduler
+        saved_total_steps = checkpoint.get('total_steps', total_steps)
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=int(saved_total_steps * config.get("warmup_ratio", 0.1)),
+            num_training_steps=saved_total_steps
+        )
+
         if 'optimizer_state_dict' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if 'scheduler_state_dict' in checkpoint:
@@ -142,7 +150,8 @@ def main():
         start_epoch = checkpoint['epoch'] + 1
         best_f1 = checkpoint.get('best_f1', 0.0)
         best_min_map = checkpoint.get('best_min_map', 0.0)
-        tracker.logger.info(f"成功恢復進度！將從 Epoch {start_epoch + 1} 開始訓練 (當前最佳 F1: {best_f1:.4f})")
+        no_improve_count = checkpoint.get('no_improve_count', 0) # 恢復計數器
+        tracker.logger.info(f"成功恢復進度！將從 Epoch {start_epoch + 1} 開始訓練 (當前最佳 F1: {best_f1:.4f}, 忍耐次數: {no_improve_count})")
 
     # ==========================================
     # 4.3 啟動編譯優化 (torch.compile)
@@ -184,7 +193,7 @@ def main():
         model.train()
         total_train_loss = 0
 
-        for batch in tqdm(train_loader, desc="Training"):
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc="Training")):
             # 解離並裝載這包 Batch 產生的 7 個輸入張量至 GPU
             w_feat, t_ids, t_mask, label_dists, sec_dists, avd_targets, lengths = [b.to(device) for b in batch]
 
@@ -227,13 +236,16 @@ def main():
             # 更新排程器 (Scheduler Step)
             scheduler.step()
 
-            total_train_loss += loss.item()
+            # 使用 global_step 統一 W&B 步數，避免圖表錯位
+            global_step = epoch * len(train_loader) + batch_idx
             wandb.log({
                 "batch_loss": loss.item(),
                 "batch_primary_loss": loss_primary.item(),
                 "batch_secondary_loss": loss_secondary.item(),
                 "batch_avd_loss": loss_avd.item(),
-            })
+            }, step=global_step)
+
+            total_train_loss += loss.item()
 
         avg_train_loss = total_train_loss / len(train_loader)
 
@@ -318,34 +330,54 @@ def main():
         tracker.logger.info(report)
 
         tracker.log_metrics(epoch, avg_train_loss, avg_val_loss, val_acc)
-        wandb.log(log_dict, step=epoch)
+        epoch_end_step = (epoch + 1) * len(train_loader) - 1
+        wandb.log(log_dict, step=epoch_end_step)
 
-        # ==========================================
-        # 7. 模型備份
-        # ==========================================
-        if min_map > best_min_map:
-            best_min_map = min_map
-            tracker.logger.info(f"少數類別準確度提升 (Min. mAP: {min_map:.4f}) ")
-            torch.save(model.state_dict(), os.path.join(tracker.weights_dir, "best_model_min_map.pth"))
-
+        # 7. 早停判定與模型備份 (雙指標監控)
         if val_macro_f1 > best_f1:
             best_f1 = val_macro_f1
-            tracker.logger.info(f"綜合泛化能力提升 (Macro F1: {val_macro_f1:.4f}) ")
-            torch.save(model.state_dict(), os.path.join(tracker.weights_dir, "best_model_f1.pth"))
+            no_improve_count = 0
+            torch.save(get_clean_state_dict(model), os.path.join(tracker.weights_dir, "best_model_f1.pth"))
+            tracker.logger.info(f"發現更佳模型 (F1: {val_macro_f1:.4f}), 已儲存。")
+        elif min_map > best_min_map:
+            no_improve_count = 0 
+            tracker.logger.info(f"F1 未進進步，但 Min mAP 有所提升，重置計數器。")
+        else:
+            no_improve_count += 1
+            tracker.logger.info(f"模型已連續 {no_improve_count} 次無改善 (上限: {config.get('early_stop_patience', 4)})")
+
+        if min_map > best_min_map:
+            best_min_map = min_map
+            torch.save(get_clean_state_dict(model), os.path.join(tracker.weights_dir, "best_model_min_map.pth"))
+            tracker.logger.info(f"發現更佳模型 (Min mAP: {min_map:.4f}), 已儲存。")
 
         # ==========================================
         # 8. 保存最新斷點 (Latest Checkpoint for Resume)
         # ==========================================
-        torch.save({
+        checkpoint_data = {
             'epoch': epoch,
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': get_clean_state_dict(model),  
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'scaler_state_dict': scaler.state_dict(),
             'best_f1': best_f1,
-            'best_min_map': best_min_map
-        }, checkpoint_path)
+            'best_min_map': best_min_map,
+            'no_improve_count': no_improve_count,
+            'total_steps': total_steps   
+        }
+        
+        # 【修改這裡】加入原子存檔機制防損毀
+        tmp_checkpoint_path = checkpoint_path + ".tmp"
+        torch.save(checkpoint_data, tmp_checkpoint_path) # 先存入暫存檔
+        os.replace(tmp_checkpoint_path, checkpoint_path) # 瞬間替換 (作業系統層級的安全操作)
+        
         tracker.logger.info(f"Epoch {epoch+1} 狀態 (含 Best 紀錄) 已備份至: {checkpoint_path}")
+        
+        # Early Stopping 判定
+        if no_improve_count >= config.get("early_stop_patience", 4):
+            tracker.logger.info(f"已達到早停門檻 ({config.get('early_stop_patience', 4)} 次沒改善)，正式中止訓練。")
+            break
+        
 
     tracker.close()
 
