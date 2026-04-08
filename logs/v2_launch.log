@@ -1,0 +1,31 @@
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/brant/.netrc.
+wandb: Currently logged in as: d1249119 (d1249119-feng-chia-university) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run 5dzkzntp
+wandb: Tracking run with wandb version 0.25.1
+wandb: Run data is saved locally in /home/brant/Project/SAILER_test/wandb/run-20260403_033026-5dzkzntp
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run 20260403_033025_SAILER_BestSingleSystem_v2
+wandb: ⭐️ View project at https://wandb.ai/d1249119-feng-chia-university/SAILER_Emotion_Recognition
+wandb: 🚀 View run at https://wandb.ai/d1249119-feng-chia-university/SAILER_Emotion_Recognition/runs/5dzkzntp
+[04-03 03:30:27] INFO - 建立新實驗資料夾: experiments/20260403_033025_SAILER_BestSingleSystem_v2
+[04-03 03:30:27] INFO - 所有的訓練紀錄將會同步保存至: experiments/20260403_033025_SAILER_BestSingleSystem_v2/logs/train.log
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Loading weights:   0%|          | 0/1259 [00:00<?, ?it/s]Loading weights:  57%|█████▋    | 717/1259 [00:00<00:00, 7160.05it/s]Loading weights: 100%|██████████| 1259/1259 [00:00<00:00, 7051.47it/s]
+Loading weights:   0%|          | 0/389 [00:00<?, ?it/s]Loading weights: 100%|██████████| 389/389 [00:00<00:00, 7002.27it/s]
+[1mRobertaModel LOAD REPORT[0m from: roberta-large
+Key                             | Status     | 
+--------------------------------+------------+-
+lm_head.layer_norm.weight       | UNEXPECTED | 
+lm_head.dense.bias              | UNEXPECTED | 
+lm_head.bias                    | UNEXPECTED | 
+lm_head.layer_norm.bias         | UNEXPECTED | 
+roberta.embeddings.position_ids | UNEXPECTED | 
+lm_head.dense.weight            | UNEXPECTED | 
+pooler.dense.bias               | MISSING    | 
+pooler.dense.weight             | MISSING    | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+- MISSING:	those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.
+從 labels_detailed.csv 聚合真實得票分佈...
+Scanning Train:   0%|          | 0/176384 [00:00<?, ?it/s]Scanning Train:   0%|          | 691/176384 [00:00<00:25, 6909.51it/s]Scanning Train:   1%|          | 1556/176384 [00:00<00:22, 7931.16it/s]Scanning Train:   1%|▏         | 2418/176384 [00:00<00:21, 8244.52it/s]Scanning Train:   2%|▏         | 3280/176384 [00:00<00:20, 8388.84it/s]Scanning Train:   2%|▏         | 4144/176384 [00:00<00:20, 8476.65it/s]Scanning Train:   3%|▎         | 4992/176384 [00:00<00:20, 8469.87it/s]Scanning Train:   3%|▎         | 5855/176384 [00:00<00:20, 8521.77it/s]Scanning Train:   4%|▍         | 6720/176384 [00:00<00:19, 8561.30it/s]Scanning Train:   4%|▍         | 7586/176384 [00:00<00:19, 8590.80it/s]Scanning Train:   5%|▍         | 8453/176384 [00:01<00:19, 8613.90it/s]Scanning Train:   5%|▌         | 9315/176384 [00:01<00:19, 8613.15it/s]Scanning Train:   6%|▌         | 10177/176384 [00:01<00:19, 8609.18it/s]Scanning Train:   6%|▋         | 11043/176384 [00:01<00:19, 8624.15it/s]Scanning Train:   7%|▋         | 11911/176384 [00:01<00:19, 8639.99it/s]Scanning Train:   7%|▋         | 12777/176384 [00:01<00:18, 8645.06it/s]Scanning Train:   8%|▊         | 13642/176384 [00:01<00:18, 8588.67it/s]Scanning Train:   8%|▊         | 14506/176384 [00:01<00:18, 8600.94it/s]Scanning Train:   9%|▊         | 15370/176384 [00:01<00:18, 8610.84it/s]Scanning Train:   9%|▉         | 16236/176384 [00:01<00:18, 8624.78it/s]Scanning Train:  10%|▉         | 17100/176384 [00:02<00:18, 8627.11it/s]Scanning Train:  10%|█         | 17965/176384 [00:02<00:18, 8632.21it/s]Scanning Train:  11%|█         | 18830/176384 [00:02<00:18, 8635.91it/s]Scanning Train:  11%|█         | 19695/176384 [00:02<00:18, 8639.11it/s]Scanning Train:  12%|█▏        | 20563/176384 [00:02<00:18, 8649.22it/s]Scanning Train:  12%|█▏        | 21432/176384 [00:02<00:17, 8659.96it/s]Scanning Train:  13%|█▎        | 22299/176384 [00:02<00:17, 8648.32it/s]Scanning Train:  13%|█▎        | 23164/176384 [00:02<00:17, 8638.92it/s]Scanning Train:  14%|█▎        | 24028/176384 [00:02<00:17, 8630.30it/s]Scanning Train:  14%|█▍        | 24892/176384 [00:02<00:17, 8621.69it/s]Scanning Train:  15%|█▍        | 25755/176384 [00:03<00:17, 8580.21it/s]Scanning Train:  15%|█▌        | 26616/176384 [00:03<00:17, 8587.89it/s]Scanning Train:  16%|█▌        | 27480/176384 [00:03<00:17, 8602.66it/s]Scanning Train:  16%|█▌        | 28341/176384 [00:03<00:17, 8558.95it/s]Scanning Train:  17%|█▋        | 29203/176384 [00:03<00:17, 8576.39it/s]Scanning Train:  17%|█▋        | 30066/176384 [00:03<00:17, 8591.52it/s]Scanning Train:  18%|█▊        | 30929/176384 [00:03<00:16, 8600.50it/s]Scanning Train:  18%|█▊        | 31795/176384 [00:03<00:16, 8617.03it/s]Scanning Train:  19%|█▊        | 32666/176384 [00:03<00:16, 8644.22it/s]Scanning Train:  19%|█▉        | 33531/176384 [00:03<00:16, 8640.42it/s]Scanning Train:  20%|█▉        | 34396/176384 [00:04<00:16, 8602.43it/s]

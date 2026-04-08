@@ -11,7 +11,7 @@ from sklearn.metrics import confusion_matrix
 from torch.utils.tensorboard import SummaryWriter
 
 class ExperimentTracker:
-    def __init__(self, experiment_name="SAILER_MSP", resume_dir=None):
+    def __init__(self, experiment_name="SAILER_MSP", resume_dir=None, config=None):
         """
         實驗追蹤器。支援建立新實驗或從舊實驗恢復。
         :param resume_dir: 若提供路徑，則會使用原資料夾而非建立新資料夾。
@@ -46,6 +46,7 @@ class ExperimentTracker:
             name=os.path.basename(self.exp_dir),      
             id=run_id,
             resume="allow" if run_id else None,
+            config=config,                    # 在初始化時鎖定 Config
             sync_tensorboard=True               
         )
         
