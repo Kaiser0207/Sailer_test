@@ -17,6 +17,23 @@ from src.experiment_tracker import ExperimentTracker
 from src.msp_dataset import MSP_Podcast_Dataset
 from src.sailer_model import SAILER_Model
 
+class SoftFocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, reduction='batchmean'):
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, log_probs, target_probs):
+        ce_loss = -target_probs * log_probs
+        probs = torch.exp(log_probs)
+        focal_weight = (1.0 - probs) ** self.gamma
+        loss = focal_weight * ce_loss
+        if self.reduction == 'batchmean':
+            return loss.sum() / log_probs.size(0)
+        elif self.reduction == 'mean':
+            return loss.mean()
+        return loss.sum()
+
 def get_clean_state_dict(model):
     state_dict = model.state_dict()
     return {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
@@ -97,8 +114,13 @@ def main():
     # ==========================================
     # 4.1 定義訓練組件 (Criterion, Optimizer, Scheduler)
     # ==========================================
-    criterion_primary = nn.KLDivLoss(reduction='batchmean')
-    criterion_secondary = nn.KLDivLoss(reduction='batchmean')
+    if config.get("use_focal_loss", True):
+        criterion_primary = SoftFocalLoss(gamma=2.0, reduction='batchmean')
+        criterion_secondary = SoftFocalLoss(gamma=2.0, reduction='batchmean')
+    else:
+        criterion_primary = nn.KLDivLoss(reduction='batchmean')
+        criterion_secondary = nn.KLDivLoss(reduction='batchmean')
+        
     criterion_avd = nn.MSELoss()
     
     optimizer = torch.optim.AdamW(
@@ -223,8 +245,9 @@ def main():
                 avd_pred = torch.cat([arousal, valence, dominance], dim=-1) 
                 loss_avd = criterion_avd(avd_pred, avd_targets)
                 
-                # Unweighted Sum 無權重總和
-                loss = loss_primary + loss_secondary + loss_avd
+                # 損失函數比例優化 (V3.1): 加入 AVD 加權 (預設 x 8.0)
+                avd_weight = config.get("avd_weight", 8.0)
+                loss = loss_primary + loss_secondary + avd_weight * loss_avd
 
             # ==== 階段三：傳播梯度更新 ====
             scaler.scale(loss).backward()
@@ -277,7 +300,8 @@ def main():
                     val_loss_secondary = criterion_secondary(F.log_softmax(secondary_logits, dim=-1), sec_dists)
                     avd_pred = torch.cat([arousal, valence, dominance], dim=-1)
                     val_loss_avd = criterion_avd(avd_pred, avd_targets)
-                    val_loss = val_loss_primary + val_loss_secondary + val_loss_avd
+                    avd_weight = config.get("avd_weight", 8.0)
+                    val_loss = val_loss_primary + val_loss_secondary + avd_weight * val_loss_avd
                     total_val_loss += val_loss.item()
 
                 probs = F.softmax(primary_logits, dim=-1)

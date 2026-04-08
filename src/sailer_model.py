@@ -163,3 +163,104 @@ class SAILER_Model(nn.Module):
         dominance = self.dominance_layer(fused_emb)                  # [B, 1]
 
         return primary_logits, secondary_logits, arousal, valence, dominance
+
+class SAILER_Modern_Model(nn.Module):
+    """
+    SAILER 現代化升級版 (WavLM + ModernBERT)
+    1. Speech Encoder: WavLM-Large (輸出 1024 維)。
+    2. Text Encoder: ModernBERT-Large (輸出 1024 維，全 28 層加權平均)。
+    3. Multimodal Fusion: `fused_emb` 為 1024(Speech) + 1024(Text) = 2048 維。
+    """
+    def __init__(
+        self,
+        wavlm_dim=1024,
+        modernbert_dim=1024,
+        num_text_layers=28,
+        hidden_dim=256,
+        num_classes=8,
+        secondary_class_num=17,
+        dropout_rate=0.1,
+    ):
+        super(SAILER_Modern_Model, self).__init__()
+
+        self.text_layer_weights = nn.Parameter(
+            torch.ones(num_text_layers) / num_text_layers
+        )
+
+        self.speech_conv = nn.Sequential(
+            nn.Conv1d(wavlm_dim, hidden_dim, kernel_size=1),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1),
+            nn.ReLU()
+        )
+
+        fused_dim = hidden_dim + modernbert_dim # 256 + 1024 = 1280
+
+        self.classifier = nn.Sequential(
+            nn.Linear(fused_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(hidden_dim, num_classes)
+        )
+
+        self.secondary_emotion_layer = nn.Sequential(
+            nn.Linear(fused_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(hidden_dim, secondary_class_num)
+        )
+
+        self.arousal_layer = nn.Sequential(
+            nn.Linear(fused_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+
+        self.valence_layer = nn.Sequential(
+            nn.Linear(fused_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+
+        self.dominance_layer = nn.Sequential(
+            nn.Linear(fused_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, w_seq, t_hidden_states, t_mask, lengths=None):
+        s_out = self.speech_conv(w_seq.transpose(1, 2))  
+
+        if lengths is not None:
+            B, D, T = s_out.shape
+            clipped_lengths = torch.clamp(lengths, max=T)
+            valid_lengths = clipped_lengths.clamp(min=1).unsqueeze(1).float()
+            mask = torch.arange(T, device=s_out.device).unsqueeze(0) < clipped_lengths.unsqueeze(1)
+            mask_float = mask.unsqueeze(1).float()  
+            s_emb = (s_out * mask_float).sum(dim=-1) / valid_lengths
+        else:
+            s_emb = s_out.mean(dim=-1)
+
+        stacked = torch.stack(t_hidden_states, dim=0)  
+        norm_weights = torch.softmax(self.text_layer_weights, dim=0)  
+        t_seq = (norm_weights.view(-1, 1, 1, 1) * stacked).sum(dim=0)  
+        t_emb = (t_seq * t_mask.unsqueeze(-1)).sum(dim=1) / (t_mask.sum(dim=1, keepdim=True) + 1e-8)  
+
+        s_emb = F.normalize(s_emb, p=2, dim=-1)
+        t_emb = F.normalize(t_emb, p=2, dim=-1)
+        fused_emb = torch.cat([s_emb, t_emb], dim=1)  
+
+        primary_logits = self.classifier(fused_emb)                  
+        secondary_logits = self.secondary_emotion_layer(fused_emb)   
+        arousal = self.arousal_layer(fused_emb)                      
+        valence = self.valence_layer(fused_emb)                      
+        dominance = self.dominance_layer(fused_emb)                  
+
+        return primary_logits, secondary_logits, arousal, valence, dominance
