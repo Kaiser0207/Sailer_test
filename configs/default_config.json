@@ -1,10 +1,10 @@
 {
-    "model_name": "SAILER_BestSingleSystem_v3.1_FocalLoss",
+    "model_name": "SAILER_BestSingleSystem_v3.1_LR0001",
     "data_dir": "/home/brant/Project/SAILER_test/datasets/MSP_Podcast_Data",
     "use_cached_features": false,
     "epochs": 15,
     "batch_size": 32,
-    "learning_rate": 0.0005,
+    "learning_rate": 0.0001,
     "weight_decay": 0.0001,
     "warmup_ratio": 0.1,
     "num_classes": 8,
