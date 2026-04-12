@@ -1,17 +1,17 @@
 {
-    "model_name": "SAILER_BestSingleSystem_v3.1_LR0001",
+    "model_name": "SAILER_BestSingleSystem_v3.2_RetroSOTA",
     "data_dir": "/home/brant/Project/SAILER_test/datasets/MSP_Podcast_Data",
     "use_cached_features": false,
     "epochs": 15,
-    "batch_size": 32,
-    "learning_rate": 0.0001,
-    "weight_decay": 0.0001,
+    "batch_size": 64,
+    "learning_rate": 0.0005,
+    "weight_decay": 0.01,
     "warmup_ratio": 0.1,
     "num_classes": 8,
     "secondary_class_num": 17,
     "dropout_rate": 0.2,
     "early_stop_patience": 4,
-    "use_focal_loss": true,
-    "avd_weight": 8.0,
+    "use_focal_loss": false,
+    "avd_weight": 1.0,
     "seed": 42
 }
