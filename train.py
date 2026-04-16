@@ -9,8 +9,12 @@ from tqdm import tqdm
 from sklearn.metrics import f1_score, average_precision_score, classification_report
 import numpy as np
 import os
+import sys
 import wandb
 import random
+
+# 追加 vox-profile-release 路徑以載入官方 WhisperWrapper
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vox-profile-release'))
 
 from src.experiment_tracker import ExperimentTracker
 
@@ -80,9 +84,19 @@ def main():
         whisper_enc = None
         print("[V3 Mode] Whisper Encoder 已跳過載入，使用預提取特徵。")
     else:
-        whisper_enc = WhisperModel.from_pretrained(
-            "openai/whisper-large-v3"
-        ).encoder.to(device)
+        use_official_whisper = config.get("use_official_whisper", False)
+        if use_official_whisper:
+            print("[V2 Mode] 載入官方強化版 SAILER Whisper (tiantiaf/whisper-large-v3-msp-podcast-emotion)...")
+            from src.model.emotion.whisper_emotion import WhisperWrapper
+            official_model = WhisperWrapper.from_pretrained("tiantiaf/whisper-large-v3-msp-podcast-emotion")
+            # 抽取背後的 encoder，轉 float 以維持 dtype 一致，並移至裝置
+            whisper_enc = official_model.backbone_model.encoder.float().to(device)
+        else:
+            print("[V2 Mode] 載入原生 OpenAI Whisper-large-v3...")
+            whisper_enc = WhisperModel.from_pretrained(
+                "openai/whisper-large-v3"
+            ).encoder.to(device)
+            
         whisper_enc.eval()
         for p in whisper_enc.parameters():
             p.requires_grad = False
@@ -199,7 +213,13 @@ def main():
                     w_seq = w_feat.transpose(1, 2)  # [B, 750, 1280]
                 else:
                     # V2: w_feat 是 Mel [B, 128, 3000]，需過 Whisper Encoder
-                    w_seq = whisper_enc(w_feat).last_hidden_state
+                    if getattr(whisper_enc, '_is_official', False) or w_feat.shape[-1] == 3000:
+                        # 官方 Whisper 的 max_source_positions 被魔改為 750 (對應 1500 frames)，
+                        # 所以要切掉我們為 vanilla Whisper 準備的後半段 1500 padding
+                        current_feat = w_feat[:, :, :1500] if config.get("use_official_whisper", False) else w_feat
+                        w_seq = whisper_enc(current_feat).last_hidden_state
+                    else:
+                        w_seq = whisper_enc(w_feat).last_hidden_state
                 roberta_out = roberta_model(input_ids=t_ids, attention_mask=t_mask, output_hidden_states=True)
                 # V2 模式下 lengths 是 Mel 幀數，需除以 2 對齊 Whisper Encoder stride
                 enc_lengths = lengths if use_cached else lengths // 2
@@ -228,8 +248,8 @@ def main():
                         # V3: w_feat 已是 Encoder 輸出 [B, 1280, 750]
                         w_seq = w_feat.transpose(1, 2)  # [B, 750, 1280]
                     else:
-                        # V2: 即時過 Whisper Encoder
-                        w_seq = whisper_enc(w_feat).last_hidden_state
+                        current_feat = w_feat[:, :, :1500] if config.get("use_official_whisper", False) else w_feat
+                        w_seq = whisper_enc(current_feat).last_hidden_state
                     roberta_out = roberta_model(input_ids=t_ids, attention_mask=t_mask, output_hidden_states=True)
                     t_hidden_states = roberta_out.hidden_states  
                 
@@ -288,7 +308,8 @@ def main():
                     if use_cached:
                         w_seq = w_feat.transpose(1, 2)
                     else:
-                        w_seq = whisper_enc(w_feat).last_hidden_state
+                        current_feat = w_feat[:, :, :1500] if config.get("use_official_whisper", False) else w_feat
+                        w_seq = whisper_enc(current_feat).last_hidden_state
                     roberta_out = roberta_model(input_ids=t_ids, attention_mask=t_mask, output_hidden_states=True)
                     t_hidden_states = roberta_out.hidden_states
 
@@ -398,8 +419,8 @@ def main():
         tracker.logger.info(f"Epoch {epoch+1} 狀態 (含 Best 紀錄) 已備份至: {checkpoint_path}")
         
         # Early Stopping 判定
-        if no_improve_count >= config.get("early_stop_patience", 4):
-            tracker.logger.info(f"已達到早停門檻 ({config.get('early_stop_patience', 4)} 次沒改善)，正式中止訓練。")
+        if no_improve_count >= config.get("early_stop_patience", 6):
+            tracker.logger.info(f"已達到早停門檻 ({config.get('early_stop_patience', 6)} 次沒改善)，正式中止訓練。")
             break
         
 

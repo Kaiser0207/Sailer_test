@@ -1,0 +1,16 @@
+# SAILER Emotion Classifier API — Dependencies
+# 安裝: pip install -r api/requirements.txt
+
+# Web framework
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+
+# ML runtime (已在主專案安裝)
+torch>=2.0.0
+torchaudio>=2.0.0
+transformers>=4.30.0
+
+# Utilities
+numpy>=1.24.0
+requests>=2.28.0
