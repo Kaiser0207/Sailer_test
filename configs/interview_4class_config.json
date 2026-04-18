@@ -1,0 +1,14 @@
+{
+    "model_name": "SAILER_v4.0_Interview_4Class",
+    "data_dir": "/home/brant/Project/SAILER_test/datasets/MSP_Podcast_Data",
+    "target_emotions": ["Neutral", "Happy", "Fear", "Surprise"],
+    "num_classes": 4,
+    "epochs": 30,
+    "batch_size": 64,
+    "learning_rate": 0.001,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.1,
+    "dropout_rate": 0.2,
+    "early_stop_patience": 8,
+    "seed": 42
+}

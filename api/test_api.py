@@ -30,7 +30,7 @@ def get_url():
 def test_health():
     """測試健康檢查端點"""
     print("=" * 50)
-    print("🏥 測試 GET /health")
+    print("測試 GET /health")
     print("=" * 50)
 
     try:
@@ -39,13 +39,13 @@ def test_health():
         print(f"   Response: {json.dumps(resp.json(), indent=2)}")
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
-        print("   ✅ Health check 通過!")
+        print("   Health check 通過!")
         return True
     except requests.exceptions.ConnectionError:
-        print("   ❌ 無法連接到 API server。請確認 server 已啟動。")
+        print("   無法連接到 API server。請確認 server 已啟動。")
         return False
     except Exception as e:
-        print(f"   ❌ 失敗: {e}")
+        print(f"   失敗: {e}")
         return False
 
 
@@ -53,7 +53,7 @@ def test_classify_with_synthetic_audio():
     """用合成的測試音檔 (3秒靜音) 測試分類端點"""
     print()
     print("=" * 50)
-    print("🎵 測試 POST /classify-emotion (合成 3 秒測試音)")
+    print("測試 POST /classify-emotion (合成 3 秒測試音)")
     print("=" * 50)
 
     import io
@@ -122,11 +122,11 @@ def test_classify_with_synthetic_audio():
             print("   ✅ 回應格式驗證通過!")
             return True
         else:
-            print(f"   ❌ 失敗: {resp.text}")
+            print(f"   失敗: {resp.text}")
             return False
 
     except Exception as e:
-        print(f"   ❌ 失敗: {e}")
+        print(f"   失敗: {e}")
         return False
 
 
@@ -134,12 +134,12 @@ def test_classify_with_real_audio(audio_path: str):
     """用真實音檔測試分類端點"""
     print()
     print("=" * 50)
-    print(f"🎤 測試 POST /classify-emotion (真實音檔)")
+    print(f"測試 POST /classify-emotion (真實音檔)")
     print(f"   音檔: {audio_path}")
     print("=" * 50)
 
     if not os.path.exists(audio_path):
-        print(f"   ❌ 音檔不存在: {audio_path}")
+        print(f"   音檔不存在: {audio_path}")
         return False
 
     try:
@@ -166,14 +166,14 @@ def test_classify_with_real_audio(audio_path: str):
                 bar = "█" * int(prob * 40)
                 print(f"     {label:>10}: {prob:.4f} {bar}")
             print()
-            print("   ✅ 真實音檔測試通過!")
+            print("   真實音檔測試通過!")
             return True
         else:
-            print(f"   ❌ 失敗: {resp.text}")
+            print(f"   失敗: {resp.text}")
             return False
 
     except Exception as e:
-        print(f"   ❌ 失敗: {e}")
+        print(f"   失敗: {e}")
         return False
 
 
@@ -181,7 +181,7 @@ def test_error_cases():
     """測試錯誤處理"""
     print()
     print("=" * 50)
-    print("⚠️  測試錯誤處理")
+    print("測試錯誤處理")
     print("=" * 50)
 
     import io
@@ -209,7 +209,7 @@ def test_error_cases():
     )
     assert resp.status_code == 400, f"期望 400，實際 {resp.status_code}"
     print(f"       Status: {resp.status_code} — {resp.json()['detail']}")
-    print("       ✅ 正確拒絕太短音檔!")
+    print("       正確拒絕太短音檔!")
 
     # 測試 2: 無效格式
     print("   [2] 無效檔案格式 (文字檔) ...")
@@ -221,10 +221,10 @@ def test_error_cases():
     )
     assert resp.status_code == 422, f"期望 422，實際 {resp.status_code}"
     print(f"       Status: {resp.status_code} — {resp.json()['detail']}")
-    print("       ✅ 正確拒絕無效格式!")
+    print("       正確拒絕無效格式!")
 
     print()
-    print("   ✅ 所有錯誤處理測試通過!")
+    print("   所有錯誤處理測試通過!")
     return True
 
 
@@ -243,13 +243,13 @@ def main():
     _config["base_url"] = args.url
 
     print()
-    print("🧪 SAILER Emotion Classifier API 測試")
-    print(f"   Target: {get_url()}")
+    print("SAILER Emotion Classifier API 測試")
+    print(f"Target: {get_url()}")
     print()
 
     # 1. Health check
     if not test_health():
-        print("\n❌ Server 未就緒，中止測試。")
+        print("\nServer 未就緒，中止測試。")
         sys.exit(1)
 
     # 2. 合成音檔測試
@@ -264,7 +264,7 @@ def main():
 
     print()
     print("=" * 50)
-    print("🎉 所有測試完成!")
+    print("所有測試完成!")
     print("=" * 50)
 
 
