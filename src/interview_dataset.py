@@ -37,9 +37,11 @@ class InterviewEmotionDataset(Dataset):
         for r in self.data_records:
             self.class_counts[r['label']] += 1
 
-        # 逆頻率 class weights（交給 CrossEntropyLoss 使用）
+        # 開根號逆頻率 class weights（交給 CrossEntropyLoss 使用）
+        # 使用 sqrt(1/freq) 而非 1/freq，避免少數類別的懲罰倍率過度極端
         inv_freq = 1.0 / (self.class_counts + 1e-8)
-        self.class_weights = torch.tensor(inv_freq / inv_freq.sum() * 4, dtype=torch.float32)
+        sqrt_inv_freq = np.sqrt(inv_freq)
+        self.class_weights = torch.tensor(sqrt_inv_freq / sqrt_inv_freq.sum() * 4, dtype=torch.float32)
 
         # 每筆樣本的採樣權重（交給 WeightedRandomSampler 使用）
         sample_weights = inv_freq[np.array([r['label'] for r in self.data_records])]

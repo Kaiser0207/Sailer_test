@@ -1,5 +1,5 @@
 {
-    "model_name": "SAILER_v4.0_Interview_4Class",
+    "model_name": "SAILER_v4.0_Phase2_FinalPeak_NoSampler",
     "data_dir": "/home/brant/Project/SAILER_test/datasets/MSP_Podcast_Data",
     "target_emotions": ["Neutral", "Happy", "Fear", "Surprise"],
     "num_classes": 4,

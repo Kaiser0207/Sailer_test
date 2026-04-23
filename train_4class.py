@@ -1,6 +1,6 @@
 """
 SAILER V4.0 — 4-Class 面試情緒偵測訓練腳本 (純語音)
-策略：Phase 3 — Focal Loss + 解凍 Whisper 最後 1 層 + model_seq + emotion_layer
+策略：Phase 2 Rerun — 訓練 model_seq + emotion_layer (Whisper 凍結)
 
 Usage:
     python train_4class.py --config configs/interview_4class_config.json
@@ -61,6 +61,7 @@ def main():
     # ==========================================
     parser = argparse.ArgumentParser(description="SAILER V4.0 — 4-Class Interview Emotion Training")
     parser.add_argument("--config", type=str, default="configs/interview_4class_config.json")
+    parser.add_argument("--pretrained_head", type=str, default=None, help="Path to Phase 1 pretrained head weights")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -88,7 +89,7 @@ def main():
 
     tracker.logger.info(f"替換 emotion_layer: 9 類 → {num_classes} 類 (面試情緒)")
 
-    # 建立新的 4 類分類頭
+    # 建立新的 4 類分類頭 (經檢查，Phase 1 權重包含 0.weight/3.weight，故須使用 Sequential 架構)
     model.emotion_layer = nn.Sequential(
         nn.Linear(hidden_dim, hidden_dim),
         nn.ReLU(),
@@ -96,8 +97,16 @@ def main():
         nn.Linear(hidden_dim, num_classes),
     )
 
+    # 如果有提供預訓練頭部，則載入
+    if args.pretrained_head:
+        tracker.logger.info(f"🚀 正在載入預訓練 Phase 1 頭部權重: {args.pretrained_head}")
+        state_dict = torch.load(args.pretrained_head, map_location=device)
+        model.emotion_layer.load_state_dict(state_dict)
+        tracker.logger.info("✅ 載入成功！架構與權重 keys 完全吻合。")
+
     # ==========================================
-    # 4. 凍結策略：Phase 3 — 訓練 Whisper最後1層 + model_seq + emotion_layer
+    # ==========================================
+    # 4. 凍結策略：Phase 2 — 只訓練 model_seq + emotion_layer (Whisper 保持凍結)
     # ==========================================
     # 先凍結一切
     for param in model.parameters():
@@ -111,12 +120,7 @@ def main():
     for param in model.model_seq.parameters():
         param.requires_grad = True
 
-    # 🔥 Phase 3: 解凍 Whisper Encoder 最後 1 層
-    whisper_last_layer = model.backbone_model.encoder.layers[-1]
-    for param in whisper_last_layer.parameters():
-        param.requires_grad = True
-    num_encoder_layers = len(model.backbone_model.encoder.layers)
-    tracker.logger.info(f"🔥 Phase 3: 解凍 Whisper Encoder 最後 1 層 (Layer {num_encoder_layers})")
+    tracker.logger.info("🔥 Phase 2: 已解凍 model_seq 與 emotion_layer，其餘 Whisper 部分保持凍結。")
 
     # 統計可訓練參數量
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -133,7 +137,13 @@ def main():
     train_dataset = InterviewEmotionDataset(data_dir, split="Train")
     val_dataset = InterviewEmotionDataset(data_dir, split="Development")
 
-    # 不使用 WeightedRandomSampler（配合 Class Weights 已足夠，雙重策略會導致少數類過度膨脹）
+    # 不使用 WeightedRandomSampler（避免過度補償導致模型認知失調，改用 Class Weights 補償）
+    # sampler = WeightedRandomSampler(
+    #     weights=train_dataset.sample_weights,
+    #     num_samples=len(train_dataset),
+    #     replacement=True
+    # )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config["batch_size"],
@@ -155,21 +165,17 @@ def main():
     # ==========================================
     # 6. Loss / Optimizer / Scheduler
     # ==========================================
-    # 🔥 Phase 3: Focal Loss (取代 CrossEntropyLoss)
+    # 使用標準量化 CrossEntropyLoss
     class_weights = train_dataset.class_weights.to(device)
-    focal_gamma = config.get("focal_gamma", 2.0)
     tracker.logger.info(f"Class Weights: {class_weights.tolist()}")
-    tracker.logger.info(f"使用 Focal Loss (gamma={focal_gamma})")
-    criterion = FocalLoss(weight=class_weights, gamma=focal_gamma)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-    # 🔥 Phase 3: 三層 Discriminative LR
-    whisper_lr = config.get("whisper_lr", 1e-5)
+    # 優化 model_seq 與 emotion_layer（實施差別學習率以保護預訓練特徵）
     optimizer = torch.optim.AdamW([
-        {'params': whisper_last_layer.parameters(), 'lr': whisper_lr},                  # Whisper最後層: 1e-5
-        {'params': model.model_seq.parameters(), 'lr': config["learning_rate"] * 0.1},  # Conv1d: 1e-4
-        {'params': model.emotion_layer.parameters(), 'lr': config["learning_rate"]},    # Head: 1e-3
+        {'params': model.model_seq.parameters(), 'lr': 1e-4},      # 中間層：小步微調，避免打散特徵空間
+        {'params': model.emotion_layer.parameters(), 'lr': 1e-3},    # 分類頭：正常學習，快速適應新標籤
     ], weight_decay=config.get("weight_decay", 0.01))
-    tracker.logger.info(f"Discriminative LR: whisper_last={whisper_lr}, model_seq={config['learning_rate']*0.1}, emotion_layer={config['learning_rate']}")
+    tracker.logger.info("實施差別學習率: model_seq=1e-4, emotion_layer=1e-3")
 
     total_steps = len(train_loader) * config["epochs"]
     warmup_steps = int(total_steps * config.get("warmup_ratio", 0.1))
@@ -211,11 +217,6 @@ def main():
         tracker.logger.info(f"====== [{epoch+1}/{config['epochs']}] 啟動 Epoch 訓練 ======")
         model.train()
 
-        # Whisper 保持 eval 模式（BatchNorm / Dropout 行為正確）
-        # 但最後一層的 LayerNorm 需要 train 模式以更新 running stats
-        model.backbone_model.eval()
-        whisper_last_layer.train()
-
         total_train_loss = 0
         train_correct = 0
         train_total = 0
@@ -223,26 +224,20 @@ def main():
         for batch_idx, (waveforms, labels, lengths) in enumerate(tqdm(train_loader, desc="Training")):
             lengths = lengths.to(device)
             labels = labels.to(device)
-            x_list = waveforms  # 官方模型內部會自行 .detach().cpu().numpy()
+            x_list = waveforms
 
             optimizer.zero_grad()
 
             with torch.amp.autocast('cuda'):
-                # Phase 3: 梯度流過 Whisper最後層 → model_seq → emotion_layer
+                # 前推：特徵流向 model_seq 與 emotion_layer
                 outputs = model(x_list, length=lengths, return_feature=True)
-                # outputs: (predicted, features, detailed_predicted, arousal, valence, dominance)
-                features = outputs[1]  # [B, 256] — model_seq 處理後的特徵
-
-                # 三層都有梯度：whisper_last_layer + model_seq + emotion_layer
-                logits = model.emotion_layer(features)  # [B, 4]
+                features = outputs[1]
+                logits = model.emotion_layer(features)
                 loss = criterion(logits, labels)
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            trainable_params = (list(whisper_last_layer.parameters()) +
-                               list(model.model_seq.parameters()) +
-                               list(model.emotion_layer.parameters()))
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, model.parameters()), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -323,7 +318,7 @@ def main():
         if val_macro_f1 > best_f1:
             best_f1 = val_macro_f1
             no_improve_count = 0
-            # 儲存所有可訓練模組的權重
+            # 完整儲存兩個核心可訓練模組
             torch.save(
                 model.emotion_layer.state_dict(),
                 os.path.join(tracker.weights_dir, "best_emotion_head.pth")
@@ -332,11 +327,7 @@ def main():
                 model.model_seq.state_dict(),
                 os.path.join(tracker.weights_dir, "best_model_seq.pth")
             )
-            torch.save(
-                whisper_last_layer.state_dict(),
-                os.path.join(tracker.weights_dir, "best_whisper_last_layer.pth")
-            )
-            tracker.logger.info(f"🎉 發現更佳模型 (Macro F1: {val_macro_f1:.4f}), 已儲存 emotion_layer + model_seq + whisper_last_layer。")
+            tracker.logger.info(f"🎉 發現更佳模型 (Macro F1: {val_macro_f1:.4f}), 已儲存 emotion_layer + model_seq。")
         else:
             no_improve_count += 1
             tracker.logger.info(f"模型已連續 {no_improve_count} 次無改善 (上限: {config.get('early_stop_patience', 8)})")
@@ -347,7 +338,6 @@ def main():
             'epoch': epoch,
             'emotion_layer_state_dict': model.emotion_layer.state_dict(),
             'model_seq_state_dict': model.model_seq.state_dict(),
-            'whisper_last_layer_state_dict': whisper_last_layer.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'scaler_state_dict': scaler.state_dict(),
